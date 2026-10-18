@@ -4,12 +4,12 @@ Framework for Assignment 1: Auditing and Explaining Diabetes Risk Prediction Mod
 The notebook (projekt.ipynb) tells the story; this module holds the reusable parts:
 
     1. Data      - loading, codebook (labels, actionability, sensitivity), splitting
-    2. Models    - candidate model factory + evaluation (overall and per subgroup)
-    3. XAI       - permutation importance, SHAP, LIME behind one common interface
-    4. Validation- method agreement, deletion (faithfulness) test, LIME stability,
-                   "safety" check of the direction of actionable advice
+    2. Models    - decision tree + neural network, tuning sweeps, evaluation (overall and per subgroup)
+    3. XAI       - SHAP and LIME behind one common interface
+    4. Validation- SHAP/LIME agreement, recovery of the tree's true features, deletion
+                   (faithfulness) test, LIME stability, "safety" check of actionable advice
     5. Actions   - what-if / counterfactual search over actionable features only
-    6. Plot style- shared colours and a matplotlib style so all figures look alike
+    6. Plot style- shared colours, matplotlib style and the stakeholder figure helpers
 
 All SHAP / LIME attributions are expressed in *probability* units (percentage
 points of predicted risk), so they are comparable across models and easy to
@@ -25,17 +25,14 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import (
     accuracy_score, brier_score_loss, f1_score, precision_score, recall_score, roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier, plot_tree
 
 SEED = 42
 TARGET = "Diabetes_binary"
@@ -51,7 +48,8 @@ class Feature:
     label: str              # plain-language name (used in director / patient figures)
     description: str        # codebook meaning (BRFSS 2015)
     kind: str               # "binary" | "ordinal" | "continuous"
-    actionable: str         # "yes" | "medical" (changeable with treatment) | "no"
+    actionable: str         # "yes" (a habit the person can change) | "medical" (health status: not one
+                            # action, but can be managed with a doctor) | "no"
     sensitive: bool = False # protected / socio-economic attribute -> bias audit
     values: dict = field(default_factory=dict)  # code -> meaning, for readable output
 
@@ -131,28 +129,61 @@ def split_data(df: pd.DataFrame, test_size=0.2, val_size=0.1, seed=SEED):
 # =============================================================================
 # 2. MODELS + EVALUATION
 # =============================================================================
-def make_models(seed=SEED) -> dict:
-    """Candidate models. They differ in inductive bias:
-    - Logistic regression: linear, additive in log-odds, directly interpretable.
-    - Random forest: bagged deep trees, non-linear + interactions, low variance.
-    - Gradient boosting: sequential shallow trees, usually the strongest on tabular data.
-    - Neural network (MLP): smooth non-linear function learned by gradient descent;
-      needs scaled inputs, a black box that can only be explained post hoc.
-    """
-    return {
-        "Logistic regression": make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)),
-        "Random forest": RandomForestClassifier(n_estimators=300, min_samples_leaf=20, max_features="sqrt",
-                                                n_jobs=-1, random_state=seed),
-        "Gradient boosting": HistGradientBoostingClassifier(learning_rate=0.05, max_iter=400, max_leaf_nodes=31,
-                                                            early_stopping=True, random_state=seed),
-        "Neural network": make_pipeline(StandardScaler(), MLPClassifier(
-            hidden_layer_sizes=(64, 32), activation="relu", alpha=1e-3, learning_rate_init=1e-3,
-            batch_size=256, max_iter=200, early_stopping=True, n_iter_no_change=10, random_state=seed)),
-    }
+def make_tree(max_depth=5, min_samples_leaf=100, seed=SEED):
+    """Glass box: a shallow tree is its own explanation (the rules can be read off)."""
+    return DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf, random_state=seed)
+
+
+def make_nn(hidden=(64, 32), alpha=1e-3, seed=SEED):
+    """Black box: smooth non-linear function with interactions; needs scaled inputs
+    and can only be explained post hoc."""
+    return make_pipeline(StandardScaler(), MLPClassifier(
+        hidden_layer_sizes=hidden, activation="relu", alpha=alpha, learning_rate_init=1e-3,
+        batch_size=256, max_iter=200, early_stopping=True, n_iter_no_change=10, random_state=seed))
+
+
+def make_models(tree_params: dict | None = None, nn_params: dict | None = None) -> dict:
+    """The two candidate models, as different as possible in inductive bias and
+    interpretability: transparent decision tree vs black-box neural network."""
+    return {"Decision tree": make_tree(**(tree_params or {})),
+            "Neural network": make_nn(**(nn_params or {}))}
+
+
+def tune_tree(X_train, y_train, X_val, y_val, depths=(3, 4, 5, 6, 8, 10, None)) -> pd.DataFrame:
+    """Validation AUC vs depth. Deeper trees gain little AUC but quickly become unreadable."""
+    rows = []
+    for d in depths:
+        t = make_tree(max_depth=d).fit(X_train, y_train)
+        rows.append({"max_depth": d if d else "none", "leaves": t.get_n_leaves(),
+                     "features used": len(tree_features(t)), "AUC": evaluate(t, X_val, y_val)["AUC"]})
+    return pd.DataFrame(rows).set_index("max_depth")
+
+
+def tune_nn(X_train, y_train, X_val, y_val, hiddens=((32,), (64, 32), (128, 64)), alphas=(1e-4, 1e-3, 1e-2)) -> pd.DataFrame:
+    """Small grid over network size and L2 penalty, scored on the validation set."""
+    rows = []
+    for h in hiddens:
+        for a in alphas:
+            m = make_nn(hidden=h, alpha=a).fit(X_train, y_train)
+            rows.append({"hidden": h, "alpha": a, "parameters": sum(w.size for w in m[-1].coefs_),
+                         "AUC": evaluate(m, X_val, y_val)["AUC"]})
+    return pd.DataFrame(rows)
+
+
+def model_columns(model) -> list[str]:
+    """Features a fitted model was trained on (all of FEATURES, or a subset in the bias audit)."""
+    return list(getattr(model, "feature_names_in_", FEATURES))
+
+
+def tree_features(tree) -> list[str]:
+    """Features the fitted tree actually splits on - the ground truth for checking explanations."""
+    cols = model_columns(tree)
+    used = {cols[i] for i in tree.tree_.feature if i >= 0}
+    return [f for f in cols if f in used]
 
 
 def evaluate(model, X, y, threshold=0.5) -> dict:
-    p = model.predict_proba(X)[:, 1]
+    p = proba_fn(model)(X)
     yhat = (p >= threshold).astype(int)
     return {
         "AUC": roc_auc_score(y, p),
@@ -168,7 +199,7 @@ def evaluate(model, X, y, threshold=0.5) -> dict:
 def subgroup_report(model, X, y, feature: str, threshold=0.5, min_n=50) -> pd.DataFrame:
     """Performance per value of a (sensitive) feature -> bias / error analysis."""
     rows = []
-    p = model.predict_proba(X)[:, 1]
+    p = proba_fn(model)(X)  # X may hold more columns than the model uses (grouping feature)
     for v in sorted(X[feature].unique()):
         m = (X[feature] == v).to_numpy()
         if m.sum() < min_n or len(np.unique(y[m])) < 2:
@@ -198,31 +229,29 @@ def error_cases(model, X, y, threshold=0.5, k=10):
 #    indexed by feature, in probability units)
 # =============================================================================
 def proba_fn(model):
-    return lambda X: model.predict_proba(pd.DataFrame(np.asarray(X), columns=FEATURES))[:, 1]
+    """Risk as a function of a DataFrame (extra columns are dropped) or of a plain array."""
+    cols = model_columns(model)
 
-
-def perm_importance(model, X, y, n_repeats=10, scoring="roc_auc", seed=SEED) -> pd.DataFrame:
-    """Global, model-agnostic: drop in AUC when a feature is shuffled."""
-    r = permutation_importance(model, X, y, n_repeats=n_repeats, scoring=scoring, random_state=seed, n_jobs=-1)
-    return (pd.DataFrame({"mean": r.importances_mean, "std": r.importances_std}, index=X.columns)
-              .sort_values("mean", ascending=False))
+    def f(X):
+        X = X[cols] if isinstance(X, pd.DataFrame) else pd.DataFrame(np.asarray(X), columns=cols)
+        return model.predict_proba(X)[:, 1]
+    return f
 
 
 class ShapExplainer:
-    """SHAP in probability space for any of our models.
-    - Tree models -> TreeExplainer (exact, fast).
-    - Anything else -> model-agnostic PermutationExplainer.
+    """SHAP in probability space, with the same background sample for both models
+    (interventional SHAP), so attributions are directly comparable.
+    - Decision tree  -> TreeExplainer (exact, fast).
+    - Neural network -> model-agnostic PermutationExplainer.
     """
 
     def __init__(self, model, X_background: pd.DataFrame, n_background=200, seed=SEED):
         import shap
         self.model = model
         bg = X_background.sample(min(n_background, len(X_background)), random_state=seed)
-        if isinstance(model, HistGradientBoostingClassifier):
-            self._exp = shap.TreeExplainer(model, data=bg, model_output="probability")
-        elif isinstance(model, RandomForestClassifier):
-            # Path-dependent TreeSHAP; RF "raw" output is already a probability.
-            self._exp = shap.TreeExplainer(model)
+        if isinstance(model, DecisionTreeClassifier):
+            # A classification tree's raw output already is the class probability.
+            self._exp = shap.TreeExplainer(model, data=bg)
         else:
             masker = shap.maskers.Independent(bg, max_samples=n_background)
             self._exp = shap.PermutationExplainer(proba_fn(model), masker)
@@ -263,26 +292,27 @@ class LimeExplainer:
         w = pd.Series({FEATURES[i]: v for i, v in e.as_map()[1]})
         return w.reindex(FEATURES).fillna(0.0), e
 
+    def explain_many(self, X: pd.DataFrame, num_samples=2000):
+        """LIME for every row of X -> (weights DataFrame like X, surrogate R^2 per row)."""
+        W, r2 = [], []
+        for _, xi in X.iterrows():
+            w, e = self.explain(xi, num_samples=num_samples)
+            W.append(w); r2.append(e.score)
+        return pd.DataFrame(W, index=X.index), pd.Series(r2, index=X.index, name="LIME R^2")
+
 
 # =============================================================================
 # 4. VALIDATING THE EXPLANATIONS
 # =============================================================================
-def rank_agreement(importances: dict[str, pd.Series]) -> pd.DataFrame:
-    """Spearman rank correlation between global importance vectors
-    (e.g. permutation vs mean|SHAP|, or model A vs model B)."""
-    names = list(importances)
-    M = pd.DataFrame(index=names, columns=names, dtype=float)
-    for a in names:
-        for b in names:
-            s1, s2 = importances[a].reindex(FEATURES), importances[b].reindex(FEATURES)
-            M.loc[a, b] = spearmanr(s1, s2).statistic
-    return M
-
-
 def topk_overlap(a: pd.Series, b: pd.Series, k=5) -> float:
     """Jaccard overlap of the k features with largest |attribution| (local agreement)."""
     ta, tb = set(a.abs().nlargest(k).index), set(b.abs().nlargest(k).index)
     return len(ta & tb) / len(ta | tb)
+
+
+def topk_share(a: pd.Series, features, k=5) -> float:
+    """Share of the k largest |attributions| that fall on `features` (e.g. the tree's true features)."""
+    return len(set(a.abs().nlargest(k).index) & set(features)) / k
 
 
 def deletion_test(model, X: pd.DataFrame, attributions: np.ndarray, X_reference: pd.DataFrame,
@@ -314,7 +344,6 @@ def deletion_test(model, X: pd.DataFrame, attributions: np.ndarray, X_reference:
 
 def lime_stability(lime: LimeExplainer, x: pd.Series, n_runs=5, k=5) -> dict:
     """Run LIME repeatedly with different seeds -> how stable is the top-k?"""
-    from lime.lime_tabular import LimeTabularExplainer  # noqa: F401  (ensures lime installed)
     runs = []
     base_state = lime._exp.random_state
     for i in range(n_runs):
@@ -387,9 +416,11 @@ def action_candidates(x: pd.Series, bmi_steps=(1, 2, 3, 5), bmi_floor=22) -> lis
     return cands
 
 
-def counterfactual_search(model, x: pd.Series, max_changes=3, target=None) -> pd.DataFrame:
+def counterfactual_search(model, x: pd.Series, max_changes=3, target=None, exclude=()) -> pd.DataFrame:
     """Greedy search over *healthy, actionable* changes only. At every step pick the
-    change that lowers risk most; stop at max_changes or when risk < target."""
+    change that lowers risk most; stop at max_changes or when risk < target.
+    Features in `exclude` (flagged unsafe by advice_safety) are never suggested: even if
+    the change happens to help this person, the model is not trustworthy on that feature."""
     f = proba_fn(model)
     cur, used, path = x.copy(), set(), []
     p_cur = float(f(cur.to_frame().T)[0])
@@ -398,7 +429,7 @@ def counterfactual_search(model, x: pd.Series, max_changes=3, target=None) -> pd
         best = None
         for c in action_candidates(cur):
             (feat, val), = c.items()
-            if feat in used and feat != "BMI":
+            if feat in exclude or (feat in used and feat != "BMI"):
                 continue
             xc = cur.copy(); xc[feat] = val
             p = float(f(xc.to_frame().T)[0])
@@ -416,7 +447,7 @@ def counterfactual_search(model, x: pd.Series, max_changes=3, target=None) -> pd
 
 
 # =============================================================================
-# 6. PLOT STYLE (shared by all stakeholder figures)
+# 6. PLOT STYLE + STAKEHOLDER FIGURES
 # =============================================================================
 COLORS = {
     "surface": "#fcfcfb", "text": "#0b0b0b", "text2": "#52514e", "grid": "#e4e3df",
@@ -424,8 +455,8 @@ COLORS = {
     "decrease": "#2a78d6",   # pushes risk DOWN (diverging blue pole)
     "neutral": "#b4b2ab",
 }
-MODEL_COLORS = {"Logistic regression": "#2a78d6", "Random forest": "#eb6834", "Gradient boosting": "#1baf7a",
-                "Neural network": "#eda100"}
+# Model colours deliberately avoid red/blue, which are reserved for "raises/lowers risk".
+MODEL_COLORS = {"Decision tree": "#1baf7a", "Neural network": "#eda100"}
 
 
 def set_style():
@@ -449,10 +480,16 @@ def savefig(fig, stakeholder: str, name: str):
 
 
 def plot_contributions(ax, contrib: pd.Series, title="", xlabel="Change in predicted risk (percentage points)",
-                       plain_labels=True, max_features=10):
-    """Horizontal diverging bars: red = raises risk, blue = lowers risk."""
-    c = contrib.reindex(contrib.abs().sort_values(ascending=False).index)[:max_features][::-1] * 100
+                       plain_labels=True, max_features=10, min_abs=0.0, values: pd.Series | None = None):
+    """Horizontal diverging bars: red = raises risk, blue = lowers risk.
+    `min_abs` hides features with (near) zero contribution, e.g. features a tree never uses.
+    `values` (one person's feature values) adds the value to each label, e.g. "Physically active: No" -
+    without it a red "Physically active" bar reads as "being active raises your risk"."""
+    c = contrib[contrib.abs() > min_abs]
+    c = c.reindex(c.abs().sort_values(ascending=False).index)[:max_features][::-1] * 100
     names = [label(f) if plain_labels else f for f in c.index]
+    if values is not None:
+        names = [f"{n}: {describe_value(f, values[f])}" if f in CODEBOOK else n for n, f in zip(names, c.index)]
     ax.barh(names, c.values, color=[COLORS["increase"] if v > 0 else COLORS["decrease"] for v in c.values],
             height=0.6, edgecolor=COLORS["surface"], linewidth=2)
     ax.axvline(0, color=COLORS["text2"], lw=1)
@@ -461,3 +498,129 @@ def plot_contributions(ax, contrib: pd.Series, title="", xlabel="Change in predi
     if title:
         ax.set_title(title)
     return ax
+
+
+def plot_grouped_bars(ax, values: pd.DataFrame, title="", xlabel="", colors=None):
+    """One horizontal bar per model (columns) for every feature (rows); colours from MODEL_COLORS
+    unless `colors` (column -> colour) is given."""
+    colors = {**MODEL_COLORS, **(colors or {})}
+    n = values.shape[1]
+    h = 0.8 / n
+    y = np.arange(len(values))
+    for i, name in enumerate(values.columns):
+        ax.barh(y + (i - (n - 1) / 2) * h, values[name], height=h, color=colors.get(name), label=name)
+    ax.set_yticks(y, values.index)
+    ax.grid(axis="y", visible=False)
+    ax.set(title=title, xlabel=xlabel)
+    ax.legend()
+    return ax
+
+
+def _plain_condition(feature: str, threshold: float) -> str:
+    """'HighBP <= 0.5' -> 'High blood pressure: No', 'GenHlth <= 2.5' -> '...: Excellent or Very good'."""
+    kind, values = CODEBOOK[feature].kind, CODEBOOK[feature].values
+    name = "BMI" if feature == "BMI" else label(feature)
+    if kind == "binary":
+        return f"{name}: {values[0]}"
+    if kind == "ordinal" and values:
+        below = [v for k, v in values.items() if k <= threshold]
+        return f"{name}: {' or '.join(below) if len(below) <= 2 else 'up to ' + below[-1]}"
+    return f"{name} ≤ {threshold:g}"
+
+
+def plot_tree_logic(ax, tree, max_depth=3, fontsize=8):
+    """The decision tree as a plain-language flowchart: every box states a condition
+    (left arrow = yes, right arrow = no), how many people end up there and how many
+    of them have (pre)diabetes. Box colour follows the red/blue risk convention."""
+    tint = mpl.colors.LinearSegmentedColormap.from_list("risk", ["#a9c9f0", "#ffffff", "#f2a4a3"])
+    nodes = plot_tree(tree, max_depth=max_depth, feature_names=FEATURES, impurity=False, proportion=True,
+                      rounded=True, precision=2, fontsize=fontsize, ax=ax)
+    visible = []
+    for node in nodes:
+        lines = node.get_text().split("\n")
+        value = next((l for l in lines if l.startswith("value")), None)
+        if value is None:            # "(...)" placeholder for a cut-off subtree
+            node.set_visible(False)
+            continue
+        visible.append(node)
+        risk = float(value.split("[")[1].rstrip("]").split(",")[1])
+        share = next(l for l in lines if l.startswith("samples")).split("= ")[1]
+        text = [f"{share} of people", f"{risk:.0%} have (pre)diabetes"]
+        if " <= " in lines[0]:
+            feat, thr = lines[0].split(" <= ")
+            text.insert(0, _plain_condition(feat, float(thr)) + "?")
+        node.set_text("\n".join(text))
+        node.get_bbox_patch().set_facecolor(tint(risk))
+    # Stretch the visible levels over the full height (the hidden placeholder row would leave a gap).
+    # Positions are in axes fractions: xyann = the box, xy = where its arrow starts (the parent box).
+    ys = [n.xyann[1] for n in visible]
+    lo, hi = min(ys), max(ys)
+    stretch = lambda y: 0.05 + 0.9 * (y - lo) / (hi - lo) if hi > lo else y
+    for n in visible:
+        n.xyann = (n.xyann[0], stretch(n.xyann[1]))
+        n.xy = (n.xy[0], stretch(n.xy[1]))
+    ax.grid(False)
+    return ax
+
+
+# Not actionable and socio-economic: shown to the patient as one summed bar (SHAP values are additive).
+BACKGROUND = ["Sex", "Income", "Education"]
+BACKGROUND_LABEL = "Background (sex, income, education)"
+
+
+def patient_figure(contrib: pd.Series, x: pd.Series, cf: pd.DataFrame, risk: float, average: float, hide=(), subtitle=""):
+    """Three panels for the patient: what raises/lowers *their* score (things they can change
+    vs everything else) and the effect of realistic changes.
+
+    Design choices (good explanations are selected, contrastive and truthful):
+    - a score out of 100 compared with the average person (the SHAP base value), not a
+      "% chance": the training data is 50/50, so the raw probability is no real-world chance;
+    - only habits count as "things you can change". High blood pressure / cholesterol are
+      "ever told you have ..." answers - they belong with the doctor, not in a to-do list;
+    - sex, income and education are summed into one background bar: not actionable, and
+      "your income raises your risk" can stigmatise without helping;
+    - features in `hide` (flagged unsafe by advice_safety) are never shown."""
+    habits = contrib[[f for f in ACTIONABLE if f not in hide]]
+    other = contrib[[f for f in FEATURES if CODEBOOK[f].actionable != "yes" and f not in BACKGROUND + list(hide)]].copy()
+    other[BACKGROUND_LABEL] = contrib[BACKGROUND].sum()
+    score, avg = round(100 * risk), round(100 * average)
+
+    fig = plt.figure(figsize=(15, 5.5))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.1], wspace=0.75)
+    ax = plot_contributions(fig.add_subplot(gs[0]), habits, title="Things you can change yourself",
+                            xlabel="Effect on your score (points)", max_features=5, min_abs=1e-3, values=x)
+    if (habits.abs() <= 1e-3).all():
+        ax.text(0.5, 0.5, "None of your habits change\nthis model's score", transform=ax.transAxes,
+                ha="center", va="center", color=COLORS["text2"])
+    plot_contributions(fig.add_subplot(gs[1]), other, title="Your health and background",
+                       xlabel="Effect on your score (points)", max_features=5, min_abs=1e-3, values=x)
+
+    ax = fig.add_subplot(gs[2])
+    steps = cf.copy(); steps["risk"] *= 100
+    ax.bar(range(len(steps)), steps["risk"], color=[COLORS["increase"]] + [COLORS["decrease"]] * (len(steps) - 1), width=0.6)
+    for i, r in enumerate(steps["risk"]):
+        ax.text(i, r + 1.5, f"{r:.0f}", ha="center", fontweight="bold")
+    ax.axhline(avg, color=COLORS["text2"], lw=1, ls="--", label=f"Average person ({avg})")
+    ax.legend(loc="upper right", fontsize=9)
+    short = (s.replace("Body mass index (BMI)", "BMI").replace("Physically active", "Exercise")
+              .replace("Eats vegetables daily", "Vegetables").replace("Eats fruit daily", "Fruit")
+              .replace(" -> ", "→").replace(": ", "\n") for s in steps["step"][1:])
+    ax.set_xticks(range(len(steps)), ["Today"] + list(short))
+    ax.set(ylim=(0, 100), title="If you change your habits...", ylabel="Risk score")
+    ax.grid(axis="x", visible=False)
+    if len(steps) == 1:
+        ax.text(0.5, 0.8, "This model finds no realistic\nchange that lowers your score", transform=ax.transAxes,
+                ha="center", va="top", color=COLORS["text2"])
+
+    fig.suptitle(f"Your diabetes risk score: {score} out of 100", fontsize=15, fontweight="bold", x=0.01, ha="left", y=1.06)
+    compare = "higher than" if score > avg else "lower than" if score < avg else "the same as"
+    fig.text(0.01, 0.97, f"This is {compare} the average person in our data (score {avg}). {subtitle}",
+             ha="left", color=COLORS["text2"])
+    note = ("How to read this: red bars raise your score, blue bars lower it. The score shows how much your answers resemble those of "
+            "people in our data who have\n(pre)diabetes - half of them did - so it is not your chance of getting diabetes, and it is not a "
+            "diagnosis. The bars show what the model reacts to,\nnot proven causes. "
+            "Talk to your doctor about blood pressure, cholesterol and your general health.")
+    if hide:
+        note += "\nSome habits are left out because the model is not reliable about them."
+    fig.text(0.01, -0.03, note, ha="left", va="top", color=COLORS["text2"], fontsize=9)
+    return fig
