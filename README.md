@@ -12,13 +12,15 @@ explanations for three stakeholders: head of data science, director of the patie
 - `figures/<stakeholder>/` – exported figures per audience
 
 ## Models
-- **Decision tree** (depth 5) – transparent; its rules are the explanation, and the features it uses serve as
-  ground truth for checking the explanation methods.
+- **Logistic regression** – transparent; its weights are the explanation, and its exact per-feature contributions
+  serve as ground truth for checking the explanation methods. (A depth-5 decision tree was tried first and replaced:
+  it could hardly give lifestyle advice.)
 - **Neural network** (MLP) – black box, explained post hoc.
 
 ## Explanation methods
 - **SHAP** – main method: local and global explanations for both models, in percentage points of risk.
 - **LIME** – second local method, used to validate SHAP (agreement, faithfulness, stability).
+- Both are also averaged over 100 persons for a global comparison with the exact contributions.
 
 ## Setup
 ```bash

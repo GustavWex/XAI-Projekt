@@ -4,9 +4,10 @@ Framework for Assignment 1: Auditing and Explaining Diabetes Risk Prediction Mod
 The notebook (projekt.ipynb) tells the story; this module holds the reusable parts:
 
     1. Data      - loading, codebook (labels, actionability, sensitivity), splitting
-    2. Models    - decision tree + neural network, tuning sweeps, evaluation (overall and per subgroup)
+    2. Models    - logistic regression + neural network, tuning sweeps, evaluation (overall and per subgroup),
+                   the logistic regression's exact contributions and points table
     3. XAI       - SHAP and LIME behind one common interface
-    4. Validation- SHAP/LIME agreement, recovery of the tree's true features, deletion
+    4. Validation- SHAP/LIME agreement, recovery of the logistic regression's exact contributions, deletion
                    (faithfulness) test, LIME stability, "safety" check of actionable advice
     5. Actions   - what-if / counterfactual search over actionable features only
     6. Plot style- shared colours, matplotlib style and the stakeholder figure helpers
@@ -25,6 +26,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
 )
@@ -32,7 +34,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.tree import DecisionTreeClassifier, plot_tree
 
 SEED = 42
 TARGET = "Diabetes_binary"
@@ -129,9 +130,10 @@ def split_data(df: pd.DataFrame, test_size=0.2, val_size=0.1, seed=SEED):
 # =============================================================================
 # 2. MODELS + EVALUATION
 # =============================================================================
-def make_tree(max_depth=5, min_samples_leaf=100, seed=SEED):
-    """Glass box: a shallow tree is its own explanation (the rules can be read off)."""
-    return DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_samples_leaf, random_state=seed)
+def make_lr(C=1.0):
+    """Glass box: one weight per feature in log-odds, the same for everyone - the weights are
+    the explanation. Inputs are standardised so the L2 penalty treats all features alike."""
+    return make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=2000))
 
 
 def make_nn(hidden=(64, 32), alpha=1e-3, seed=SEED):
@@ -142,21 +144,17 @@ def make_nn(hidden=(64, 32), alpha=1e-3, seed=SEED):
         batch_size=256, max_iter=200, early_stopping=True, n_iter_no_change=10, random_state=seed))
 
 
-def make_models(tree_params: dict | None = None, nn_params: dict | None = None) -> dict:
-    """The two candidate models, as different as possible in inductive bias and
-    interpretability: transparent decision tree vs black-box neural network."""
-    return {"Decision tree": make_tree(**(tree_params or {})),
+def make_models(lr_params: dict | None = None, nn_params: dict | None = None) -> dict:
+    """The two models: transparent logistic regression (additive, no interactions) vs
+    black-box neural network (non-linear, with interactions)."""
+    return {"Logistic regression": make_lr(**(lr_params or {})),
             "Neural network": make_nn(**(nn_params or {}))}
 
 
-def tune_tree(X_train, y_train, X_val, y_val, depths=(3, 4, 5, 6, 8, 10, None)) -> pd.DataFrame:
-    """Validation AUC vs depth. Deeper trees gain little AUC but quickly become unreadable."""
-    rows = []
-    for d in depths:
-        t = make_tree(max_depth=d).fit(X_train, y_train)
-        rows.append({"max_depth": d if d else "none", "leaves": t.get_n_leaves(),
-                     "features used": len(tree_features(t)), "AUC": evaluate(t, X_val, y_val)["AUC"]})
-    return pd.DataFrame(rows).set_index("max_depth")
+def tune_lr(X_train, y_train, X_val, y_val, Cs=(1e-4, 1e-3, 1e-2, 1e-1, 1, 10)) -> pd.DataFrame:
+    """Validation AUC vs the inverse L2 penalty C."""
+    return pd.DataFrame([{"C": C, "AUC": evaluate(make_lr(C).fit(X_train, y_train), X_val, y_val)["AUC"]}
+                         for C in Cs]).set_index("C")
 
 
 def tune_nn(X_train, y_train, X_val, y_val, hiddens=((32,), (64, 32), (128, 64)), alphas=(1e-4, 1e-3, 1e-2)) -> pd.DataFrame:
@@ -175,11 +173,37 @@ def model_columns(model) -> list[str]:
     return list(getattr(model, "feature_names_in_", FEATURES))
 
 
-def tree_features(tree) -> list[str]:
-    """Features the fitted tree actually splits on - the ground truth for checking explanations."""
-    cols = model_columns(tree)
-    used = {cols[i] for i in tree.tree_.feature if i >= 0}
-    return [f for f in cols if f in used]
+def lr_weights(model) -> pd.Series:
+    """Logistic regression weights per ORIGINAL unit (log-odds per BMI point, per yes, ...)."""
+    scaler, lr = model[0], model[-1]
+    return pd.Series(lr.coef_[0] / scaler.scale_, index=model_columns(model))
+
+
+def lr_contributions(model, X: pd.DataFrame, X_background: pd.DataFrame, n_background=200, seed=SEED) -> pd.DataFrame:
+    """The logistic regression's EXACT contribution of every feature for every person, in
+    log-odds: weight x (person's value - background mean). The same background sample as
+    ShapExplainer, so this is the ground truth SHAP and LIME should recover (direction, ranking)."""
+    bg = X_background.sample(min(n_background, len(X_background)), random_state=seed)
+    cols = model_columns(model)
+    return (X[cols] - bg[cols].mean()) * lr_weights(model)
+
+
+# Units for the director's points table: a point = 0.1 log-odds per unit below (default: per 1).
+POINT_UNITS = {"BMI": 5, "MentHlth": 10, "PhysHlth": 10}
+POINT_LABELS = {
+    "BMI": "BMI (per 5 points higher)", "Age": "Age (per 5 years older)",
+    "GenHlth": "General health (per step worse)", "Income": "Income (per step higher)",
+    "Education": "Education (per step higher)", "MentHlth": "Poor mental health (per 10 days)",
+    "PhysHlth": "Poor physical health (per 10 days)", "Sex": "Male",
+}
+
+
+def lr_points(model, point=0.1) -> pd.Series:
+    """The logistic regression as a points table: whole points per answer, adding up to the score."""
+    w = lr_weights(model)
+    pts = pd.Series({f: round(w[f] * POINT_UNITS.get(f, 1) / point) for f in w.index})
+    pts.index = [POINT_LABELS.get(f, label(f)) for f in pts.index]
+    return pts[pts != 0]
 
 
 def evaluate(model, X, y, threshold=0.5) -> dict:
@@ -238,29 +262,21 @@ def proba_fn(model):
 
 
 class ShapExplainer:
-    """SHAP in probability space, with the same background sample for both models
-    (interventional SHAP), so attributions are directly comparable.
-    - Decision tree  -> TreeExplainer (exact, fast).
-    - Neural network -> model-agnostic PermutationExplainer.
-    """
+    """SHAP in probability space with the model-agnostic PermutationExplainer and the same
+    background sample for both models, so attributions are directly comparable."""
 
     def __init__(self, model, X_background: pd.DataFrame, n_background=200, seed=SEED):
         import shap
         self.model = model
         bg = X_background.sample(min(n_background, len(X_background)), random_state=seed)
-        if isinstance(model, DecisionTreeClassifier):
-            # A classification tree's raw output already is the class probability.
-            self._exp = shap.TreeExplainer(model, data=bg)
-        else:
-            masker = shap.maskers.Independent(bg, max_samples=n_background)
-            self._exp = shap.PermutationExplainer(proba_fn(model), masker)
+        masker = shap.maskers.Independent(bg, max_samples=n_background)
+        self._exp = shap.PermutationExplainer(proba_fn(model), masker)
 
     def __call__(self, X: pd.DataFrame):
         """Returns a shap.Explanation (n_samples x n_features) for the positive class."""
-        import shap
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            ex = self._exp(X, silent=True) if isinstance(self._exp, shap.PermutationExplainer) else self._exp(X)
+            ex = self._exp(X, silent=True)
         if ex.values.ndim == 3:  # (n, features, classes) -> class 1
             ex = ex[:, :, 1]
         ex.data = X.to_numpy()
@@ -310,7 +326,7 @@ def topk_overlap(a: pd.Series, b: pd.Series, k=5) -> float:
 
 
 def topk_share(a: pd.Series, features, k=5) -> float:
-    """Share of the k largest |attributions| that fall on `features` (e.g. the tree's true features)."""
+    """Share of the k largest |attributions| that fall on `features` (e.g. the exact top features of the logistic regression)."""
     return len(set(a.abs().nlargest(k).index) & set(features)) / k
 
 
@@ -455,7 +471,7 @@ COLORS = {
     "neutral": "gray",
 }
 # Model colours avoid red/blue, which are used for "raises/lowers risk".
-MODEL_COLORS = {"Decision tree": "tab:green", "Neural network": "tab:orange"}
+MODEL_COLORS = {"Logistic regression": "tab:green", "Neural network": "tab:orange"}
 
 
 def set_style():
@@ -474,7 +490,7 @@ def savefig(fig, stakeholder: str, name: str):
 def plot_contributions(ax, contrib: pd.Series, title="", xlabel="Change in predicted risk (percentage points)",
                        plain_labels=True, max_features=10, min_abs=0.0, values: pd.Series | None = None):
     """Horizontal diverging bars: red = raises risk, blue = lowers risk.
-    `min_abs` hides features with (near) zero contribution, e.g. features a tree never uses.
+    `min_abs` hides features with (near) zero contribution, e.g. features a model hardly uses.
     `values` (one person's feature values) adds the value to each label, e.g. "Physically active: No" -
     without it a red "Physically active" bar reads as "being active raises your risk"."""
     c = contrib[contrib.abs() > min_abs]
@@ -507,73 +523,16 @@ def plot_grouped_bars(ax, values: pd.DataFrame, title="", xlabel="", colors=None
     return ax
 
 
-def _plain_question(feature: str, threshold: float) -> tuple[str, str]:
-    """A split 'feature <= threshold' as a yes/no question, plus the answer that leads to the LEFT
-    child (feature <= threshold). Yes/no features are asked the positive way round
-    ('High blood pressure?'), so for them the left child is 'no' - no double negatives."""
-    kind, values = CODEBOOK[feature].kind, CODEBOOK[feature].values
-    if kind == "binary":
-        return f"{label(feature)}?", "no"
-    if feature == "Age":
-        return f"Younger than {AGE_BANDS[int(threshold) + 1].split('-')[0].rstrip('+')}?", "yes"
-    if feature == "GenHlth":
-        return f"General health {values[int(threshold)].lower()} or better?", "yes"
-    if kind == "ordinal" and values:
-        below = [v for k, v in values.items() if k <= threshold]
-        return f"{label(feature)}: {' or '.join(below) if len(below) <= 2 else 'up to ' + below[-1]}?", "yes"
-    name = "BMI" if feature == "BMI" else label(feature)
-    return f"{name} {int(threshold)} or lower?", "yes"
-
-
-def plot_tree_logic(ax, tree, max_depth=3, fontsize=8):
-    """The decision tree as a plain-language flowchart: every box asks a question, every arrow
-    says which answer it stands for, and every box shows how many people end up there and how
-    many of them have (pre)diabetes. The bottom row is shown as risk groups (the questions below
-    it are cut off). Box colour follows the red/blue risk convention."""
-    tint = mpl.colors.LinearSegmentedColormap.from_list("risk", ["#a9c9f0", "#ffffff", "#f2a4a3"])
-    nodes = plot_tree(tree, max_depth=max_depth, feature_names=model_columns(tree), impurity=False,
-                      proportion=True, rounded=True, precision=2, fontsize=fontsize, ax=ax)
-    visible = []  # (annotation, question, answer of the left child, share, risk)
-    for node in nodes:
-        lines = node.get_text().split("\n")
-        value = next((l for l in lines if l.startswith("value")), None)
-        if value is None:            # "(...)" placeholder for a cut-off subtree
-            node.set_visible(False)
-            continue
-        risk = float(value.split("[")[1].rstrip("]").split(",")[1])
-        share = float(next(l for l in lines if l.startswith("samples")).split("= ")[1].rstrip("%"))
-        question, left = None, None
-        if " <= " in lines[0]:
-            feat, thr = lines[0].split(" <= ")
-            question, left = _plain_question(feat, float(thr))
-        visible.append((node, question, left, share, risk))
-
-    # Stretch the visible levels over the full height (the hidden placeholder row would leave a gap).
-    # Positions are in axes fractions: xyann = the box, xy = where its arrow starts (the parent box).
-    ys = [n.xyann[1] for n, *_ in visible]
-    lo, hi = min(ys), max(ys)
-    stretch = lambda y: 0.05 + 0.9 * (y - lo) / (hi - lo) if hi > lo else y
-    for node, question, left, share, risk in visible:
-        text = [f"{share:.0f}% of people", f"{risk:.0%} have (pre)diabetes"]
-        if question and node.xyann[1] > lo:   # bottom row = risk groups, their questions are cut off
-            text.insert(0, question)
-        node.set_text("\n".join(text))
-        node.get_bbox_patch().set_facecolor(tint(risk))
-        node.xyann = (node.xyann[0], stretch(node.xyann[1]))
-        node.xy = (node.xy[0], stretch(node.xy[1]))
-
-    # Label every arrow with its answer: find the parent (whose box sits where the arrow starts).
-    boxes = {(round(n.xyann[0], 6), round(n.xyann[1], 6)): (n, left) for n, _, left, _, _ in visible}
-    for node, *_ in visible:
-        parent = boxes.get((round(node.xy[0], 6), round(node.xy[1], 6)))
-        if parent is None or parent[0] is node:   # the root has no arrow
-            continue
-        left = parent[1]
-        answer = left if node.xyann[0] < parent[0].xyann[0] else {"yes": "no", "no": "yes"}[left]
-        ax.text((node.xy[0] + node.xyann[0]) / 2, (node.xy[1] + node.xyann[1]) / 2, answer,
-                transform=ax.transAxes, ha="center", va="center", fontsize=fontsize + 1, fontweight="bold",
-                color=COLORS["text2"], bbox=dict(boxstyle="round,pad=0.2", fc=COLORS["surface"], ec="none"))
-    ax.grid(False)
+def plot_points(ax, points: pd.Series, title="", max_features=12):
+    """The points table as bars: red = adds points (higher risk), blue = subtracts points."""
+    pts = points.reindex(points.abs().sort_values(ascending=False).index)[:max_features][::-1]
+    ax.barh(pts.index, pts.values, color=[COLORS["increase"] if v > 0 else COLORS["decrease"] for v in pts.values], height=0.6)
+    for i, v in enumerate(pts.values):
+        ax.text(v + (0.3 if v > 0 else -0.3), i, f"{v:+d}", va="center", ha="left" if v > 0 else "right")
+    ax.axvline(0, color=COLORS["text2"], lw=1)
+    lim = pts.abs().max() + 2
+    ax.set(xlim=(-lim, lim), xlabel="Points", title=title)
+    ax.grid(axis="y", visible=False)
     return ax
 
 
