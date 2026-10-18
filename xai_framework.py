@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    accuracy_score, brier_score_loss, f1_score, precision_score, recall_score, roc_auc_score,
+    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
@@ -192,7 +192,6 @@ def evaluate(model, X, y, threshold=0.5) -> dict:
         "Specificity": recall_score(1 - y, 1 - yhat),
         "Precision": precision_score(y, yhat, zero_division=0),
         "F1": f1_score(y, yhat),
-        "Brier": brier_score_loss(y, p),
     }
 
 
@@ -450,26 +449,19 @@ def counterfactual_search(model, x: pd.Series, max_changes=3, target=None, exclu
 # 6. PLOT STYLE + STAKEHOLDER FIGURES
 # =============================================================================
 COLORS = {
-    "surface": "#fcfcfb", "text": "#0b0b0b", "text2": "#52514e", "grid": "#e4e3df",
-    "increase": "#e34948",   # pushes risk UP   (diverging red pole)
-    "decrease": "#2a78d6",   # pushes risk DOWN (diverging blue pole)
-    "neutral": "#b4b2ab",
+    "surface": "white", "text": "black", "text2": "dimgray", "grid": "lightgray",
+    "increase": "tab:red",    # pushes risk UP
+    "decrease": "tab:blue",   # pushes risk DOWN
+    "neutral": "gray",
 }
-# Model colours deliberately avoid red/blue, which are reserved for "raises/lowers risk".
-MODEL_COLORS = {"Decision tree": "#1baf7a", "Neural network": "#eda100"}
+# Model colours avoid red/blue, which are used for "raises/lowers risk".
+MODEL_COLORS = {"Decision tree": "tab:green", "Neural network": "tab:orange"}
 
 
 def set_style():
-    mpl.rcParams.update({
-        "figure.facecolor": COLORS["surface"], "axes.facecolor": COLORS["surface"],
-        "savefig.facecolor": COLORS["surface"], "figure.dpi": 110, "savefig.dpi": 200,
-        "axes.edgecolor": COLORS["grid"], "axes.labelcolor": COLORS["text2"],
-        "xtick.color": COLORS["text2"], "ytick.color": COLORS["text2"], "text.color": COLORS["text"],
-        "axes.spines.top": False, "axes.spines.right": False,
-        "axes.grid": True, "grid.color": COLORS["grid"], "grid.linewidth": 0.8,
-        "axes.axisbelow": True, "font.size": 10, "axes.titlesize": 12, "axes.titleweight": "bold",
-        "axes.titlelocation": "left", "legend.frameon": False,
-    })
+    plt.style.use("default")
+    mpl.rcParams.update({"figure.dpi": 100, "savefig.dpi": 150, "axes.grid": True, "grid.alpha": 0.3,
+                         "axes.spines.top": False, "axes.spines.right": False})
 
 
 def savefig(fig, stakeholder: str, name: str):
@@ -490,8 +482,7 @@ def plot_contributions(ax, contrib: pd.Series, title="", xlabel="Change in predi
     names = [label(f) if plain_labels else f for f in c.index]
     if values is not None:
         names = [f"{n}: {describe_value(f, values[f])}" if f in CODEBOOK else n for n, f in zip(names, c.index)]
-    ax.barh(names, c.values, color=[COLORS["increase"] if v > 0 else COLORS["decrease"] for v in c.values],
-            height=0.6, edgecolor=COLORS["surface"], linewidth=2)
+    ax.barh(names, c.values, color=[COLORS["increase"] if v > 0 else COLORS["decrease"] for v in c.values], height=0.6)
     ax.axvline(0, color=COLORS["text2"], lw=1)
     ax.grid(axis="y", visible=False)
     ax.set_xlabel(xlabel)
@@ -516,49 +507,72 @@ def plot_grouped_bars(ax, values: pd.DataFrame, title="", xlabel="", colors=None
     return ax
 
 
-def _plain_condition(feature: str, threshold: float) -> str:
-    """'HighBP <= 0.5' -> 'High blood pressure: No', 'GenHlth <= 2.5' -> '...: Excellent or Very good'."""
+def _plain_question(feature: str, threshold: float) -> tuple[str, str]:
+    """A split 'feature <= threshold' as a yes/no question, plus the answer that leads to the LEFT
+    child (feature <= threshold). Yes/no features are asked the positive way round
+    ('High blood pressure?'), so for them the left child is 'no' - no double negatives."""
     kind, values = CODEBOOK[feature].kind, CODEBOOK[feature].values
-    name = "BMI" if feature == "BMI" else label(feature)
     if kind == "binary":
-        return f"{name}: {values[0]}"
+        return f"{label(feature)}?", "no"
+    if feature == "Age":
+        return f"Younger than {AGE_BANDS[int(threshold) + 1].split('-')[0].rstrip('+')}?", "yes"
+    if feature == "GenHlth":
+        return f"General health {values[int(threshold)].lower()} or better?", "yes"
     if kind == "ordinal" and values:
         below = [v for k, v in values.items() if k <= threshold]
-        return f"{name}: {' or '.join(below) if len(below) <= 2 else 'up to ' + below[-1]}"
-    return f"{name} ≤ {threshold:g}"
+        return f"{label(feature)}: {' or '.join(below) if len(below) <= 2 else 'up to ' + below[-1]}?", "yes"
+    name = "BMI" if feature == "BMI" else label(feature)
+    return f"{name} {int(threshold)} or lower?", "yes"
 
 
 def plot_tree_logic(ax, tree, max_depth=3, fontsize=8):
-    """The decision tree as a plain-language flowchart: every box states a condition
-    (left arrow = yes, right arrow = no), how many people end up there and how many
-    of them have (pre)diabetes. Box colour follows the red/blue risk convention."""
+    """The decision tree as a plain-language flowchart: every box asks a question, every arrow
+    says which answer it stands for, and every box shows how many people end up there and how
+    many of them have (pre)diabetes. The bottom row is shown as risk groups (the questions below
+    it are cut off). Box colour follows the red/blue risk convention."""
     tint = mpl.colors.LinearSegmentedColormap.from_list("risk", ["#a9c9f0", "#ffffff", "#f2a4a3"])
-    nodes = plot_tree(tree, max_depth=max_depth, feature_names=FEATURES, impurity=False, proportion=True,
-                      rounded=True, precision=2, fontsize=fontsize, ax=ax)
-    visible = []
+    nodes = plot_tree(tree, max_depth=max_depth, feature_names=model_columns(tree), impurity=False,
+                      proportion=True, rounded=True, precision=2, fontsize=fontsize, ax=ax)
+    visible = []  # (annotation, question, answer of the left child, share, risk)
     for node in nodes:
         lines = node.get_text().split("\n")
         value = next((l for l in lines if l.startswith("value")), None)
         if value is None:            # "(...)" placeholder for a cut-off subtree
             node.set_visible(False)
             continue
-        visible.append(node)
         risk = float(value.split("[")[1].rstrip("]").split(",")[1])
-        share = next(l for l in lines if l.startswith("samples")).split("= ")[1]
-        text = [f"{share} of people", f"{risk:.0%} have (pre)diabetes"]
+        share = float(next(l for l in lines if l.startswith("samples")).split("= ")[1].rstrip("%"))
+        question, left = None, None
         if " <= " in lines[0]:
             feat, thr = lines[0].split(" <= ")
-            text.insert(0, _plain_condition(feat, float(thr)) + "?")
-        node.set_text("\n".join(text))
-        node.get_bbox_patch().set_facecolor(tint(risk))
+            question, left = _plain_question(feat, float(thr))
+        visible.append((node, question, left, share, risk))
+
     # Stretch the visible levels over the full height (the hidden placeholder row would leave a gap).
     # Positions are in axes fractions: xyann = the box, xy = where its arrow starts (the parent box).
-    ys = [n.xyann[1] for n in visible]
+    ys = [n.xyann[1] for n, *_ in visible]
     lo, hi = min(ys), max(ys)
     stretch = lambda y: 0.05 + 0.9 * (y - lo) / (hi - lo) if hi > lo else y
-    for n in visible:
-        n.xyann = (n.xyann[0], stretch(n.xyann[1]))
-        n.xy = (n.xy[0], stretch(n.xy[1]))
+    for node, question, left, share, risk in visible:
+        text = [f"{share:.0f}% of people", f"{risk:.0%} have (pre)diabetes"]
+        if question and node.xyann[1] > lo:   # bottom row = risk groups, their questions are cut off
+            text.insert(0, question)
+        node.set_text("\n".join(text))
+        node.get_bbox_patch().set_facecolor(tint(risk))
+        node.xyann = (node.xyann[0], stretch(node.xyann[1]))
+        node.xy = (node.xy[0], stretch(node.xy[1]))
+
+    # Label every arrow with its answer: find the parent (whose box sits where the arrow starts).
+    boxes = {(round(n.xyann[0], 6), round(n.xyann[1], 6)): (n, left) for n, _, left, _, _ in visible}
+    for node, *_ in visible:
+        parent = boxes.get((round(node.xy[0], 6), round(node.xy[1], 6)))
+        if parent is None or parent[0] is node:   # the root has no arrow
+            continue
+        left = parent[1]
+        answer = left if node.xyann[0] < parent[0].xyann[0] else {"yes": "no", "no": "yes"}[left]
+        ax.text((node.xy[0] + node.xyann[0]) / 2, (node.xy[1] + node.xyann[1]) / 2, answer,
+                transform=ax.transAxes, ha="center", va="center", fontsize=fontsize + 1, fontweight="bold",
+                color=COLORS["text2"], bbox=dict(boxstyle="round,pad=0.2", fc=COLORS["surface"], ec="none"))
     ax.grid(False)
     return ax
 
