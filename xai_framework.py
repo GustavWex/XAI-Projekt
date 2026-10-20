@@ -541,34 +541,24 @@ BACKGROUND = ["Sex", "Income", "Education"]
 BACKGROUND_LABEL = "Background (sex, income, education)"
 
 
-def patient_figure(contrib: pd.Series, x: pd.Series, cf: pd.DataFrame, risk: float, average: float, hide=(), subtitle=""):
-    """Three panels for the patient: what raises/lowers *their* score (things they can change
-    vs everything else) and the effect of realistic changes.
-
-    Design choices (good explanations are selected, contrastive and truthful):
-    - a score out of 100 compared with the average person (the SHAP base value), not a
-      "% chance": the training data is 50/50, so the raw probability is no real-world chance;
-    - only habits count as "things you can change". High blood pressure / cholesterol are
-      "ever told you have ..." answers - they belong with the doctor, not in a to-do list;
-    - sex, income and education are summed into one background bar: not actionable, and
-      "your income raises your risk" can stigmatise without helping;
-    - features in `hide` (flagged unsafe by advice_safety) are never shown."""
+def plot_patient_factors(ax_habits, ax_other, contrib: pd.Series, x: pd.Series, hide=()):
+    """The patient's own contributions in two panels: habits they can change, and the rest
+    (health and background, with sex/income/education summed into one bar)."""
     habits = contrib[[f for f in ACTIONABLE if f not in hide]]
     other = contrib[[f for f in FEATURES if CODEBOOK[f].actionable != "yes" and f not in BACKGROUND + list(hide)]].copy()
     other[BACKGROUND_LABEL] = contrib[BACKGROUND].sum()
-    score, avg = round(100 * risk), round(100 * average)
-
-    fig = plt.figure(figsize=(15, 5.5))
-    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.1], wspace=0.75)
-    ax = plot_contributions(fig.add_subplot(gs[0]), habits, title="Things you can change yourself",
-                            xlabel="Effect on your score (points)", max_features=5, min_abs=1e-3, values=x)
+    plot_contributions(ax_habits, habits, title="Things you can change yourself",
+                       xlabel="Effect on your score (points)", max_features=5, min_abs=1e-3, values=x)
     if (habits.abs() <= 1e-3).all():
-        ax.text(0.5, 0.5, "None of your habits change\nthis model's score", transform=ax.transAxes,
-                ha="center", va="center", color=COLORS["text2"])
-    plot_contributions(fig.add_subplot(gs[1]), other, title="Your health and background",
+        ax_habits.text(0.5, 0.5, "None of your habits change\nthis model's score", transform=ax_habits.transAxes,
+                       ha="center", va="center", color=COLORS["text2"])
+    plot_contributions(ax_other, other, title="Your health and background",
                        xlabel="Effect on your score (points)", max_features=5, min_abs=1e-3, values=x)
 
-    ax = fig.add_subplot(gs[2])
+
+def plot_patient_changes(ax, cf: pd.DataFrame, average: float):
+    """The patient's score after each realistic change (counterfactual path), against the average person."""
+    avg = round(100 * average)
     steps = cf.copy(); steps["risk"] *= 100
     ax.bar(range(len(steps)), steps["risk"], color=[COLORS["increase"]] + [COLORS["decrease"]] * (len(steps) - 1), width=0.6)
     for i, r in enumerate(steps["risk"]):
@@ -585,13 +575,32 @@ def patient_figure(contrib: pd.Series, x: pd.Series, cf: pd.DataFrame, risk: flo
         ax.text(0.5, 0.8, "This model finds no realistic\nchange that lowers your score", transform=ax.transAxes,
                 ha="center", va="top", color=COLORS["text2"])
 
+
+def patient_figure(contrib: pd.Series, x: pd.Series, cf: pd.DataFrame, risk: float, average: float, hide=(), subtitle=""):
+    """Three panels for the patient: what raises/lowers *their* score (things they can change
+    vs everything else) and the effect of realistic changes.
+
+    Design choices (good explanations are selected, contrastive and truthful):
+    - a score out of 100 compared with the average person (the SHAP base value), not a
+      "% chance": the training data is 50/50, so the raw probability is no real-world chance;
+    - only habits count as "things you can change". High blood pressure / cholesterol are
+      "ever told you have ..." answers - they belong with the doctor, not in a to-do list;
+    - sex, income and education are summed into one background bar: not actionable, and
+      "your income raises your risk" can stigmatise without helping;
+    - features in `hide` (flagged unsafe by advice_safety) are never shown."""
+    score, avg = round(100 * risk), round(100 * average)
+    fig = plt.figure(figsize=(15, 5.5))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.1], wspace=0.75)
+    plot_patient_factors(fig.add_subplot(gs[0]), fig.add_subplot(gs[1]), contrib, x, hide)
+    plot_patient_changes(fig.add_subplot(gs[2]), cf, average)
+
     fig.suptitle(f"Your diabetes risk score: {score} out of 100", fontsize=15, fontweight="bold", x=0.01, ha="left", y=1.06)
     compare = "higher than" if score > avg else "lower than" if score < avg else "the same as"
     fig.text(0.01, 0.97, f"This is {compare} the average person in our data (score {avg}). {subtitle}",
              ha="left", color=COLORS["text2"])
     note = ("How to read this: red bars raise your score, blue bars lower it. The score shows how much your answers resemble those of "
-            "people in our data who have\n(pre)diabetes - half of them did - so it is not your chance of getting diabetes, and it is not a "
-            "diagnosis. The bars show what the model reacts to,\nnot proven causes. "
+            "people in our data who have\n(pre)diabetes. Half of them had it, so the score is not your chance of getting diabetes, and it "
+            "is not a diagnosis. The bars show what the model\nreacts to, not proven causes. "
             "Talk to your doctor about blood pressure, cholesterol and your general health.")
     if hide:
         note += "\nSome habits are left out because the model is not reliable about them."
